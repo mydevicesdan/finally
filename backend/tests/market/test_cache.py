@@ -1,5 +1,7 @@
 """Tests for PriceCache."""
 
+import threading
+
 from app.market.cache import PriceCache
 
 
@@ -101,3 +103,68 @@ class TestPriceCache:
         cache = PriceCache()
         update = cache.update("AAPL", 190.12345)
         assert update.price == 190.12
+
+    def test_zero_timestamp_respected(self):
+        """A timestamp of 0.0 is a real value, not 'missing'."""
+        cache = PriceCache()
+        assert cache.update("AAPL", 190.0, timestamp=0.0).timestamp == 0.0
+
+    def test_remove_bumps_version(self):
+        """Removal is a change the SSE stream must see."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.00)
+        v = cache.version
+        cache.remove("AAPL")
+        assert cache.version == v + 1
+
+    def test_remove_nonexistent_keeps_version(self):
+        cache = PriceCache()
+        v = cache.version
+        cache.remove("AAPL")
+        assert cache.version == v
+
+    def test_session_open_defaults_to_first_price(self):
+        cache = PriceCache()
+        update = cache.update("AAPL", 190.00)
+        assert update.session_open == 190.00
+        assert update.day_change == 0.0
+
+    def test_session_open_explicit_then_kept(self):
+        cache = PriceCache()
+        cache.update("AAPL", 190.00, session_open=180.00)
+        update = cache.update("AAPL", 191.00)
+        assert update.session_open == 180.00
+        assert update.previous_price == 190.00
+        assert update.day_change == 11.00
+
+    def test_session_open_can_be_replaced(self):
+        cache = PriceCache()
+        cache.update("AAPL", 190.00, session_open=180.00)
+        assert cache.update("AAPL", 190.00, session_open=185.00).session_open == 185.00
+
+    def test_snapshot_is_consistent(self):
+        cache = PriceCache()
+        cache.update("AAPL", 190.00)
+        cache.update("MSFT", 420.00)
+        version, prices = cache.snapshot()
+        assert version == cache.version == 2
+        assert set(prices) == {"AAPL", "MSFT"}
+        prices.clear()  # a copy: mutating it must not affect the cache
+        assert len(cache) == 2
+
+    def test_concurrent_writers(self):
+        """Every update from every thread is counted exactly once."""
+        cache = PriceCache()
+        tickers = [f"T{i}" for i in range(8)]
+
+        def writer(ticker: str) -> None:
+            for n in range(1000):
+                cache.update(ticker, 100.0 + n % 7)
+
+        threads = [threading.Thread(target=writer, args=(t,)) for t in tickers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert cache.version == 8 * 1000
+        assert set(cache.get_all()) == set(tickers)
