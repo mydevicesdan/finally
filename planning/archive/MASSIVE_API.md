@@ -1,5 +1,7 @@
 # Massive API Reference (formerly Polygon.io)
 
+> **⚠️ Outdated — do not implement from this file.** Several field names below don't exist in the `massive` 2.x SDK. `last_trade.timestamp` is really `last_trade.sip_timestamp`, in **nanoseconds**. `day.previous_close` and `day.change_percent` are really `prev_day.close` and `snap.todays_change_percent`. `market_type` must be passed as the string `"stocks"` (`SnapshotMarketType.STOCKS.value`), not the enum. The verified field mapping is in `planning/MARKET_DATA_DESIGN.md` §10.2.
+
 Reference documentation for the Massive (formerly Polygon.io) REST API as used in FinAlly.
 
 ## Overview

@@ -5,6 +5,8 @@
 **Code reviewed:** `main` at `3199cb5`.
 **Supersedes:** `planning/archive/MARKET_DATA_REVIEW.md` (2026-02-10). All 7 issues from that review are resolved.
 
+> **Status (2026-09-26): all findings resolved.** Every action in §7 is implemented, plus one more high-severity bug found during the fix work (§3.15). 174 tests pass with 100% line coverage, and ruff lint and format are clean. See **§8 Resolution** for details and two corrections to this review.
+
 ---
 
 ## 1. Verdict
@@ -154,6 +156,17 @@ If nothing changes (empty watchlist, or future long Massive intervals), the stre
 - `_generate_events()` swallows `CancelledError`. Use `try/finally` for the log line so cancellation propagates.
 - 3 test files aren't `ruff format`-clean.
 
+### 3.15 [High] Massive requests go to a non-existent URL (found during the fix work)
+
+`_fetch_snapshots()` passes `market_type=SnapshotMarketType.STOCKS`. In `massive` 2.2.0, `SnapshotMarketType` is a plain `Enum`, not a `str` enum. The SDK builds the path with `f"/v2/snapshot/locale/{locale}/markets/{market_type}/tickers"`, and `get_locale()` compares against the string `"stocks"`. The request therefore goes to:
+
+```
+/v2/snapshot/locale/global/markets/SnapshotMarketType.STOCKS/tickers   (wrong)
+/v2/snapshot/locale/us/markets/stocks/tickers                           (correct, with "stocks")
+```
+
+This is independent of §3.1. Even with parsing fixed, no request would have succeeded. The original review missed it because every test replaced the fetch method, so the SDK's URL construction never ran. **Fix:** pass `SnapshotMarketType.STOCKS.value`. `test_request_url_built_by_real_sdk` drives a real `RESTClient` down to `_get` and asserts the path. That test fails on the old argument and passes with the fix.
+
 ---
 
 ## 4. Test Suite Assessment
@@ -170,7 +183,7 @@ The suite is fast (under 6 s) and well organized. Its main weakness is that it c
 | `test_custom_event_probability` asserts nothing | `test_simulator_source.py` | Only checks that it doesn't crash. |
 | No statistical checks | `test_simulator.py` | Nobody verifies per-tick σ ≈ σ√dt, sector correlation ≈ 0.6 / 0.3, or Cholesky on a large universe. These need a seedable RNG (§3.11). |
 | Timing-based assertions | `test_custom_update_interval` (`version > initial + 2` within 50 ms) | Can flake on a loaded CI runner. Prefer stepping the simulator directly or using looser bounds. |
-| Duplicate assertion | `test_unknown_ticker_gets_random_seed_price` | The same `assert` appears twice. |
+| ~~Duplicate assertion~~ | `test_unknown_ticker_gets_random_seed_price` | **Withdrawn: this was a reviewer error.** The test has one assertion. Two overlapping `sed` ranges printed the same line twice. |
 | No tests for normalization, duplicates, removal race, lifecycle misuse | — | §3.5, §3.7 and §3.10 went unnoticed. |
 
 ---
@@ -221,3 +234,34 @@ In priority order. Items 1–4 should land before the portfolio, watchlist and c
 | 9 | `ruff format`. Fix the weak or duplicate tests listed in §4. Correct `archive/MASSIVE_API.md`. | 3.14, §4 | XS |
 
 `planning/MARKET_DATA_DESIGN.md` has complete code for items 1–8. In a scratch copy of the package that code passes 21 targeted tests covering these findings, against `massive` 2.2.0.
+
+---
+
+## 8. Resolution
+
+Implemented on branch `claude/market-data-backend-design-nki6e5`.
+
+| Finding | Resolution | Verified by |
+|---|---|---|
+| 3.1 Massive parsing | `parse_snapshot()` reads `last_trade.sip_timestamp` (ns). Fallbacks: `min.close` (ms timestamp), `day.close`, `prev_day.close`, then `updated` / now | `TestParseSnapshot` (8 tests on `TickerSnapshot.from_dict` wire JSON) |
+| 3.2 Daily change | `PriceUpdate.session_open`, `day_change`, `day_change_percent`, included in `to_dict()` and SSE. Massive uses `prev_day.close`; the simulator uses its start price | `test_models.py`, `test_start_primes_cache` (matches Massive's `todaysChangePerc`) |
+| 3.3 Held positions | `app/market/sync.py::sync_tracked_tickers(source, desired)`. The contract is documented in `backend/CLAUDE.md` for the app layer | `test_sync.py` |
+| 3.4 Removal not streamed | `remove()` bumps `version` when something was removed. SSE sends `data: {}` | `test_stream.py::test_removal_is_streamed`, `test_empty_cache_sends_empty_snapshot`. Under uvicorn, removing every ticker now streams `data: {}` |
+| 3.5 In-flight removal race | Writes are filtered by the tracked set re-read after the fetch | `test_removed_during_fetch_not_reinserted` |
+| 3.6 Rate limits | `RESTClient(retries=0)`, backoff 15→30→60→120 s, auth/plan errors → max backoff with one actionable log, `min_poll_spacing = min(interval, 12 s)` | `TestFailures`, `test_early_poll_respects_min_spacing`, `test_default_client_disables_urllib3_retries` |
+| 3.7 Normalization | `tickers.py::normalize_ticker()` in both sources, including `start()` (with de-duplication) | `test_tickers.py`, `test_start_normalizes_and_dedupes` (both sources) |
+| 3.8 Router | `APIRouter` created inside `create_stream_router()` | `test_each_call_builds_independent_router` |
+| 3.9 Unknown seed prices | `seed_price_for()` from `crc32(symbol)` | `test_unknown_seed_price_is_stable_across_instances` |
+| 3.10 Lifecycle | Simulator created eagerly (add before start works). A second `start()` raises in both sources | `test_add_ticker_before_start`, `test_start_twice_raises` (both sources) |
+| 3.11 Determinism | Per-instance `np.random.default_rng(seed)`. `seed` parameter on `SimulatorDataSource` | `test_same_seed_same_path`, statistics tests |
+| 3.12 Cache details | `timestamp is None`; locked `version`; atomic `snapshot()` | `test_zero_timestamp_respected`, `test_snapshot_is_consistent`, `test_concurrent_writers` |
+| 3.13 Keep-alive | `: keep-alive` after 15 s idle | `test_heartbeat_when_idle` |
+| 3.14 Robustness | Cholesky `LinAlgError` fallback; the fetch receives a copy of the ticker list; SSE uses `try/finally` (no swallowed cancel); ruff format applied | `test_cholesky_failure_falls_back_to_independent`, `test_fetch_receives_copy_of_tickers` |
+| 3.15 Enum URL | `SnapshotMarketType.STOCKS.value` | `test_request_url_built_by_real_sdk` |
+| §4 test gaps | Massive tests rebuilt on real SDK models with an injected `client=`. SSE covered (33% → 100%). The resilience test now actually raises. The event-probability test asserts a 2–5% move. Timing waits use polling with generous timeouts. Statistical checks added: σ within 5% of σ√dt, correlations 0.6/0.5/0.3 ± 0.05 | 174 tests, 100% coverage, 5 consecutive clean runs |
+| Docs | `backend/CLAUDE.md` rewritten for the new API and the tracking rule. `MARKET_DATA_SUMMARY.md` updated. `MARKET_DATA_DESIGN.md` code blocks regenerated from the real modules. `archive/MASSIVE_API.md` flagged as outdated. `.env.example` added (incl. `MASSIVE_POLL_INTERVAL`) | — |
+
+**Corrections to this review.** (1) The "duplicate assertion" item in §4 was a reviewer error and is withdrawn. (2) §3.15 was missed and has been added above.
+
+**Remaining limitation.** The Massive path hasn't been exercised against the live API: no key was available and outbound access was blocked. Parsing (real SDK models) and request construction (real `RESTClient` down to `_get`) are both tested against the installed SDK. The first run with a real key should confirm prices arrive, and check the rate-limit and plan-error body texts matched by `classify_error()`. Those texts are based on Massive's documented error format, not observed responses.
+

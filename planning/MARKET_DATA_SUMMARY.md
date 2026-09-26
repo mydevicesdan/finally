@@ -1,103 +1,99 @@
 # Market Data Backend — Summary
 
-**Status:** Complete, tested, reviewed, all issues resolved.
+**Status:** Complete and tested. Every finding in `MARKET_DATA_REVIEW.md` is fixed, and the backend is ready for the portfolio, watchlist, chat and frontend layers.
+
+Detailed design, with the module code: `MARKET_DATA_DESIGN.md`. Review and resolution log: `MARKET_DATA_REVIEW.md`. Usage guide for backend agents: `backend/CLAUDE.md`.
 
 ## What Was Built
 
-A complete market data subsystem in `backend/app/market/` (8 modules, ~500 lines) providing live price simulation and real market data via a unified interface.
+A market data subsystem in `backend/app/market/` (11 modules, about 940 lines). It produces live simulated prices, or real prices from the Massive API, behind one interface.
 
 ### Architecture
 
 ```
 MarketDataSource (ABC)
-├── SimulatorDataSource  →  GBM simulator (default, no API key needed)
-└── MassiveDataSource    →  Polygon.io REST poller (when MASSIVE_API_KEY set)
+├── SimulatorDataSource  →  correlated GBM simulator (default, no API key needed)
+└── MassiveDataSource    →  Massive/Polygon REST snapshot poller (when MASSIVE_API_KEY set)
         │
         ▼
-   PriceCache (thread-safe, in-memory)
+   PriceCache (thread-safe, versioned)
         │
         ├──→ SSE stream endpoint (/api/stream/prices)
-        ├──→ Portfolio valuation
-        └──→ Trade execution
+        ├──→ Portfolio valuation / snapshots
+        ├──→ Trade execution
+        └──→ LLM context
 ```
 
 ### Modules
 
 | File | Purpose |
 |------|---------|
-| `models.py` | `PriceUpdate` — immutable frozen dataclass (ticker, price, previous_price, timestamp, change, direction) |
-| `interface.py` | `MarketDataSource` — abstract base class defining `start/stop/add_ticker/remove_ticker/get_tickers` |
-| `cache.py` | `PriceCache` — thread-safe price store with version counter for SSE change detection |
-| `seed_prices.py` | Realistic seed prices, per-ticker GBM params (drift/volatility), correlation groups |
-| `simulator.py` | `GBMSimulator` (Geometric Brownian Motion with Cholesky-correlated moves) + `SimulatorDataSource` |
-| `massive_client.py` | `MassiveDataSource` — REST polling client for Polygon.io via the `massive` package |
-| `factory.py` | `create_market_data_source()` — selects simulator or Massive based on `MASSIVE_API_KEY` env var |
-| `stream.py` | `create_stream_router()` — FastAPI SSE endpoint factory using version-based change detection |
+| `models.py` | `PriceUpdate`, a frozen dataclass: ticker, price, previous_price, timestamp, session_open. Properties give tick change/direction and day change/% |
+| `cache.py` | `PriceCache`: thread-safe store. Version bumps on update and remove. Atomic `snapshot()` |
+| `interface.py` | `MarketDataSource`: abstract base class with `start/stop/add_ticker/remove_ticker/get_tickers` and a documented contract |
+| `tickers.py` | `normalize_ticker()`: trim, upper-case, validate. Used by both sources and API routes |
+| `seed_prices.py` | Seed prices, per-ticker GBM drift/volatility, correlation groups |
+| `simulator.py` | `GBMSimulator` (seedable, Cholesky-correlated, 2–5% shock events) + `SimulatorDataSource` |
+| `massive_client.py` | `parse_snapshot()`, `classify_error()`, `MassiveDataSource` (rate-limit spacing, backoff, early poll on add) |
+| `factory.py` | `create_market_data_source()`: reads `MASSIVE_API_KEY`, `MASSIVE_POLL_INTERVAL` |
+| `stream.py` | `create_stream_router()` + `generate_price_events()`: full-snapshot SSE with keep-alive |
+| `sync.py` | `sync_tracked_tickers()`: keeps the source tracking watchlist ∪ open positions |
 
 ### Key Design Decisions
 
-- **Strategy pattern** — both data sources implement the same ABC; downstream code is source-agnostic
-- **PriceCache as single point of truth** — producers write, consumers read; no direct coupling
-- **GBM with correlated moves** — Cholesky decomposition of sector-based correlation matrix; tech stocks correlate at 0.6, finance at 0.5, cross-sector at 0.3
-- **Random shock events** — ~0.1% chance per tick per ticker of a 2-5% move for visual drama
-- **SSE over WebSockets** — simpler, one-way push, universal browser support
+- **Strategy pattern plus a single cache.** Producers write to the cache and consumers read from it, so no consumer depends on which source is active.
+- **GBM with correlated moves.** Tech-to-tech correlation is 0.6, finance-to-finance 0.5, and cross-sector or TSLA 0.3. Per-tick volatility is calibrated to real intraday ranges (checked statistically in tests).
+- **Two change references.** Tick-to-tick change drives the price flash. Change since `session_open` drives the daily change % (previous close under Massive, simulation start under the simulator).
+- **Deterministic starting prices.** Unknown tickers get a CRC-derived seed price, so held positions don't re-price randomly on restart.
+- **Full-snapshot SSE.** Every frame is the whole ticker map, so clients replace rather than merge, and removals and empty watchlists stream correctly.
+- **Massive safety.** The SDK's own retries are off. The poll loop handles retries: at most 5 requests/min by default, exponential backoff, and auth/plan errors logged once with a remedy.
 
 ## Test Suite
 
-**73 tests, all passing.** 6 test modules in `backend/tests/market/`.
+**174 tests, all passing, 100% line coverage.** `ruff check` and `ruff format --check` are clean. The suite runs in about 2–4 s and was stable across repeated runs.
 
-| Module | Tests | Coverage |
-|--------|-------|----------|
-| test_models.py | 11 | models.py: 100% |
-| test_cache.py | 13 | cache.py: 100% |
-| test_simulator.py | 17 | simulator.py: 98% |
-| test_simulator_source.py | 10 | (integration tests) |
-| test_factory.py | 7 | factory.py: 100% |
-| test_massive.py | 13 | massive_client.py: 56% (expected — API methods mocked) |
+| Module | Tests | Focus |
+|--------|------:|-------|
+| test_massive.py | 41 | Real SDK models via `TickerSnapshot.from_dict`, URL built by the real `RESTClient`, fallbacks, backoff, removal race, early poll |
+| test_simulator.py | 32 | GBM behaviour, determinism, σ calibration, sector correlation, shocks, Cholesky fallback |
+| test_cache.py | 21 | Versioning (incl. removal), session_open, snapshot, concurrent writers |
+| test_tickers.py | 21 | Normalization and validation |
+| test_simulator_source.py | 17 | Lifecycle, normalization, add-before-start, exception resilience |
+| test_models.py | 14 | Tick and day change, serialization |
+| test_factory.py | 13 | Env selection, poll interval parsing |
+| test_stream.py | 10 | SSE frames, empty snapshots, removals, heartbeat, headers, router independence |
+| test_sync.py | 5 | Watchlist ∪ positions reconciliation |
 
-Overall coverage: 84%.
+It was also verified end to end under uvicorn with `curl`: frames arrive every 500 ms, a ticker added at runtime is priced immediately, and removing every ticker streams `data: {}`.
 
-## Code Review & Fixes Applied
-
-A comprehensive code review identified 7 issues. All were resolved:
-
-1. **pyproject.toml build config** — added `[tool.hatch.build.targets.wheel] packages = ["app"]`
-2. **Lazy imports removed** — `massive` is a core dependency; imports moved to top level
-3. **SSE return type fixed** — `_generate_events` annotated as `AsyncGenerator[str, None]`
-4. **Public `get_tickers()`** — added to `GBMSimulator` to avoid private attribute access
-5. **Correlation constants cleaned up** — removed unused `DEFAULT_CORR`, consolidated into `CROSS_GROUP_CORR`
-6. **Unused test imports removed** — `pytest`, `math`, `asyncio` cleaned from 4 test files
-7. **Massive test mocks fixed** — `source._client` set in tests, patches target correct names
+**Not verified:** a live call to the Massive API. No API key was available, and outbound access to `api.massive.com` was blocked. Response parsing and URL construction are tested against the real SDK code instead.
 
 ## Demo
-
-A Rich terminal demo is available at `backend/market_data_demo.py`:
 
 ```bash
 cd backend
 uv run market_data_demo.py
 ```
 
-Displays a live-updating dashboard with all 10 tickers, sparklines, color-coded direction arrows, and an event log for notable price moves. Runs 60 seconds or until Ctrl+C.
+Shows a live Rich terminal dashboard with all 10 tickers, sparklines, direction arrows and an event log. It runs for 60 seconds or until Ctrl+C.
 
 ## Usage for Downstream Code
 
 ```python
-from app.market import PriceCache, create_market_data_source
+from app.market import PriceCache, create_market_data_source, sync_tracked_tickers
 
-# Startup
+# Startup (inside the FastAPI lifespan)
 cache = PriceCache()
-source = create_market_data_source(cache)  # Reads MASSIVE_API_KEY
-await source.start(["AAPL", "GOOGL", "MSFT", ...])
+source = create_market_data_source(cache)          # reads MASSIVE_API_KEY
+await source.start(watchlist_tickers | position_tickers)
 
 # Read prices
-update = cache.get("AAPL")          # PriceUpdate or None
-price = cache.get_price("AAPL")     # float or None
-all_prices = cache.get_all()        # dict[str, PriceUpdate]
+update = cache.get("AAPL")                          # PriceUpdate or None
+price = cache.get_price("AAPL")                     # float or None
+update.day_change_percent                           # watchlist "daily change %"
 
-# Dynamic watchlist
-await source.add_ticker("TSLA")
-await source.remove_ticker("GOOGL")
+# After any watchlist change, trade, or LLM action batch
+await sync_tracked_tickers(source, watchlist_tickers | position_tickers)
 
 # Shutdown
 await source.stop()

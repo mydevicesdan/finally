@@ -1,201 +1,366 @@
-"""Tests for MassiveDataSource (mocked)."""
+"""Tests for the Massive data source.
 
+Snapshots are built with the real SDK model (`TickerSnapshot.from_dict`) from
+wire-shaped JSON, so field names and units are checked against massive itself.
+The HTTP client is replaced by a MagicMock injected via `client=`.
+"""
+
+import asyncio
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from massive import RESTClient
+from massive.exceptions import AuthError, BadResponse
+from massive.rest.models import TickerSnapshot
 
 from app.market.cache import PriceCache
-from app.market.massive_client import MassiveDataSource
+from app.market.massive_client import (
+    MAX_BACKOFF,
+    MassiveDataSource,
+    classify_error,
+    parse_snapshot,
+)
+
+# One element of the snapshot response's "tickers" array, exactly as on the wire.
+AAPL_JSON = {
+    "ticker": "AAPL",
+    "todaysChange": 1.25,
+    "todaysChangePerc": 0.66,
+    "updated": 1727366399123456789,
+    "day": {"o": 189.1, "h": 191.2, "l": 188.7, "c": 190.4, "v": 48211234, "vw": 190.02},
+    "min": {
+        "av": 48211234,
+        "o": 190.3,
+        "h": 190.5,
+        "l": 190.2,
+        "c": 190.4,
+        "v": 12000,
+        "vw": 190.35,
+        "t": 1727366340000,
+        "n": 120,
+    },
+    "prevDay": {"o": 187.5, "h": 189.6, "l": 187.1, "c": 189.17, "v": 51000000, "vw": 188.9},
+    "lastTrade": {
+        "p": 190.42,
+        "s": 100,
+        "x": 4,
+        "t": 1727366399123456789,
+        "c": [14, 41],
+        "i": "52983525029461",
+    },
+    "lastQuote": {"P": 190.43, "S": 2, "p": 190.41, "s": 3, "t": 1727366399223456789},
+}
 
 
-def _make_snapshot(ticker: str, price: float, timestamp_ms: int) -> MagicMock:
-    """Create a mock Massive snapshot object."""
-    snap = MagicMock()
-    snap.ticker = ticker
-    snap.last_trade = MagicMock()
-    snap.last_trade.price = price
-    snap.last_trade.timestamp = timestamp_ms
-    return snap
+def snap(data: dict) -> TickerSnapshot:
+    return TickerSnapshot.from_dict(data)
 
 
-@pytest.mark.asyncio
-class TestMassiveDataSource:
-    """Unit tests for MassiveDataSource with mocked API."""
+def aapl(**overrides) -> TickerSnapshot:
+    return snap({**AAPL_JSON, **overrides})
 
-    async def test_poll_updates_cache(self):
-        """Test that polling updates the cache."""
+
+def make_source(cache: PriceCache | None = None, **kwargs) -> tuple[MassiveDataSource, MagicMock]:
+    client = MagicMock()
+    client.get_snapshot_all.return_value = []
+    source = MassiveDataSource(
+        "test-key", PriceCache() if cache is None else cache, client=client, **kwargs
+    )
+    return source, client
+
+
+class TestParseSnapshot:
+    def test_parses_real_wire_shape(self):
+        q = parse_snapshot(snap(AAPL_JSON))
+        assert q is not None
+        assert q.ticker == "AAPL"
+        assert q.price == 190.42
+        assert q.timestamp == pytest.approx(1727366399.123456789)  # ns -> s
+        assert q.session_open == 189.17
+
+    def test_minute_bar_fallback(self):
+        data = {k: v for k, v in AAPL_JSON.items() if k != "lastTrade"}
+        q = parse_snapshot(snap(data))
+        assert q.price == 190.4
+        assert q.timestamp == pytest.approx(1727366340.0)  # ms -> s
+
+    def test_day_close_fallback(self):
+        data = {"ticker": "AAPL", "day": {"c": 190.4}, "updated": 1727366399000000000}
+        q = parse_snapshot(snap(data))
+        assert q.price == 190.4
+        assert q.timestamp == pytest.approx(1727366399.0)
+        assert q.session_open is None
+
+    def test_prev_close_fallback(self):
+        data = {"ticker": "AAPL", "prevDay": {"c": 189.17}, "updated": 1727366399000000000}
+        q = parse_snapshot(snap(data))
+        assert q.price == 189.17
+        assert q.session_open == 189.17
+
+    def test_zero_price_trade_ignored(self):
+        q = parse_snapshot(aapl(lastTrade={"p": 0, "t": 1}))
+        assert q.price == 190.4  # falls through to the minute bar
+
+    def test_no_timestamp_uses_now(self):
+        before = time.time()
+        q = parse_snapshot(snap({"ticker": "AAPL", "day": {"c": 1.0}}))
+        assert before <= q.timestamp <= time.time()
+
+    def test_no_price_returns_none(self):
+        assert parse_snapshot(snap({"ticker": "ZZZZ"})) is None
+
+    def test_no_ticker_returns_none(self):
+        assert parse_snapshot(snap({"lastTrade": {"p": 1.0}})) is None
+
+
+class TestClassifyError:
+    def test_auth_error(self):
+        assert classify_error(AuthError("no key")) == "auth"
+
+    def test_unknown_key(self):
+        assert classify_error(BadResponse('{"status":"ERROR","error":"Unknown API Key"}')) == "auth"
+
+    def test_not_authorized(self):
+        body = '{"status":"NOT_AUTHORIZED","message":"You are not entitled to this data."}'
+        assert classify_error(BadResponse(body)) == "forbidden"
+
+    def test_rate_limit(self):
+        body = '{"status":"ERROR","error":"You\'ve exceeded the maximum requests per minute"}'
+        assert classify_error(BadResponse(body)) == "rate_limit"
+
+    def test_transient(self):
+        assert classify_error(ConnectionError("reset")) == "transient"
+        assert classify_error(BadResponse("internal error")) == "transient"
+
+
+class TestPolling:
+    async def test_start_primes_cache(self):
         cache = PriceCache()
-        source = MassiveDataSource(
-            api_key="test-key",
-            price_cache=cache,
-            poll_interval=60.0,  # Long interval so the loop doesn't auto-poll
-        )
-        source._tickers = ["AAPL", "GOOGL"]
-        source._client = MagicMock()  # Satisfy the _poll_once guard
-
-        mock_snapshots = [
-            _make_snapshot("AAPL", 190.50, 1707580800000),
-            _make_snapshot("GOOGL", 175.25, 1707580800000),
-        ]
-
-        with patch.object(source, "_fetch_snapshots", return_value=mock_snapshots):
-            await source._poll_once()
-
-        assert cache.get_price("AAPL") == 190.50
-        assert cache.get_price("GOOGL") == 175.25
-
-    async def test_malformed_snapshot_skipped(self):
-        """Test that malformed snapshots are skipped gracefully."""
-        cache = PriceCache()
-        source = MassiveDataSource(
-            api_key="test-key",
-            price_cache=cache,
-            poll_interval=60.0,
-        )
-        source._tickers = ["AAPL", "BAD"]
-        source._client = MagicMock()  # Satisfy the _poll_once guard
-
-        good_snap = _make_snapshot("AAPL", 190.50, 1707580800000)
-        bad_snap = MagicMock()
-        bad_snap.ticker = "BAD"
-        bad_snap.last_trade = None  # Will cause AttributeError
-
-        with patch.object(source, "_fetch_snapshots", return_value=[good_snap, bad_snap]):
-            await source._poll_once()
-
-        # Good ticker processed, bad one skipped
-        assert cache.get_price("AAPL") == 190.50
-        assert cache.get_price("BAD") is None
-
-    async def test_api_error_does_not_crash(self):
-        """Test that API errors don't crash the poller."""
-        cache = PriceCache()
-        source = MassiveDataSource(
-            api_key="test-key",
-            price_cache=cache,
-            poll_interval=60.0,
-        )
-        source._tickers = ["AAPL"]
-        source._client = MagicMock()  # Satisfy the _poll_once guard
-
-        with patch.object(source, "_fetch_snapshots", side_effect=Exception("network error")):
-            await source._poll_once()  # Should not raise
-
-        assert cache.get_price("AAPL") is None  # No update happened
-
-    async def test_timestamp_conversion(self):
-        """Test that timestamps are converted from milliseconds to seconds."""
-        cache = PriceCache()
-        source = MassiveDataSource(
-            api_key="test-key",
-            price_cache=cache,
-            poll_interval=60.0,
-        )
-        source._tickers = ["AAPL"]
-        source._client = MagicMock()  # Satisfy the _poll_once guard
-
-        mock_snapshots = [_make_snapshot("AAPL", 190.50, 1707580800000)]
-
-        with patch.object(source, "_fetch_snapshots", return_value=mock_snapshots):
-            await source._poll_once()
+        source, client = make_source(cache)
+        client.get_snapshot_all.return_value = [snap(AAPL_JSON)]
+        await source.start(["AAPL"])
 
         update = cache.get("AAPL")
-        assert update is not None
-        assert update.timestamp == 1707580800.0  # Converted to seconds
+        assert update.price == 190.42
+        assert update.session_open == 189.17
+        assert round(update.day_change_percent, 2) == 0.66  # matches todaysChangePerc
+        assert update.timestamp == pytest.approx(1727366399.123456789)
+        await source.stop()
 
-    async def test_add_ticker(self):
-        """Test adding a ticker."""
+    async def test_requests_all_tickers_in_one_call(self):
+        source, client = make_source()
+        await source.start(["AAPL", "MSFT", "GOOGL"])
+        client.get_snapshot_all.assert_called_once()
+        assert client.get_snapshot_all.call_args.kwargs["tickers"] == ["AAPL", "MSFT", "GOOGL"]
+        await source.stop()
+
+    async def test_start_normalizes_and_dedupes(self):
+        source, client = make_source()
+        await source.start(["aapl", " AAPL ", "msft"])
+        assert source.get_tickers() == ["AAPL", "MSFT"]
+        await source.stop()
+
+    async def test_start_twice_raises(self):
+        source, _ = make_source()
+        await source.start(["AAPL"])
+        with pytest.raises(RuntimeError):
+            await source.start(["AAPL"])
+        await source.stop()
+
+    async def test_unusable_snapshot_skipped(self):
         cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache)
+        source, client = make_source(cache)
+        client.get_snapshot_all.return_value = [snap(AAPL_JSON), snap({"ticker": "BAD"})]
+        await source.start(["AAPL", "BAD"])
+        assert cache.get_price("AAPL") == 190.42
+        assert cache.get("BAD") is None
+        await source.stop()
 
-        await source.add_ticker("AAPL")
-        assert "AAPL" in source.get_tickers()
-
-    async def test_add_ticker_uppercase_normalization(self):
-        """Test that tickers are normalized to uppercase."""
+    async def test_untracked_ticker_in_response_ignored(self):
         cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache)
+        source, client = make_source(cache)
+        client.get_snapshot_all.return_value = [snap(AAPL_JSON), aapl(ticker="MSFT")]
+        await source.start(["AAPL"])
+        assert "MSFT" not in cache
+        await source.stop()
 
+    async def test_missing_ticker_warned_once(self, caplog):
+        source, client = make_source()
+        await source.start(["AAPL", "ZZZZ"])
+        await source._poll_once()
+        warnings = [r for r in caplog.records if "ZZZZ" in r.getMessage()]
+        assert len(warnings) == 1
+        await source.stop()
+
+    async def test_empty_tickers_skips_request(self):
+        source, client = make_source()
+        await source.start([])
+        client.get_snapshot_all.assert_not_called()
+        await source.stop()
+
+    async def test_removed_during_fetch_not_reinserted(self):
+        cache = PriceCache()
+        source, _ = make_source(cache)
+        source._tickers = ["AAPL"]
+
+        def slow_fetch(tickers):
+            time.sleep(0.05)  # runs in the worker thread
+            return [snap(AAPL_JSON)]
+
+        source._fetch_snapshots = slow_fetch
+        poll = asyncio.create_task(source._poll_once())
+        await asyncio.sleep(0.01)
+        await source.remove_ticker("AAPL")
+        await poll
+        assert "AAPL" not in cache
+
+    async def test_fetch_receives_copy_of_tickers(self):
+        source, client = make_source()
+        await source.start(["AAPL"])
+        passed = client.get_snapshot_all.call_args.kwargs["tickers"]
+        assert passed is not source._tickers
+        await source.stop()
+
+    async def test_add_ticker_polls_early(self):
+        cache = PriceCache()
+        source, client = make_source(cache, poll_interval=60, min_poll_spacing=0)
+        await source.start(["MSFT"])
+        client.get_snapshot_all.return_value = [snap(AAPL_JSON)]
         await source.add_ticker("aapl")
-        assert "AAPL" in source.get_tickers()
+        await asyncio.sleep(0.1)  # far less than the 60 s interval
+        assert cache.get_price("AAPL") == 190.42
+        await source.stop()
 
-    async def test_add_ticker_strips_whitespace(self):
-        """Test that ticker whitespace is stripped."""
+    async def test_early_poll_respects_min_spacing(self):
+        source, client = make_source(poll_interval=60, min_poll_spacing=30)
+        await source.start(["MSFT"])
+        await source.add_ticker("AAPL")
+        await asyncio.sleep(0.1)
+        assert client.get_snapshot_all.call_count == 1  # still waiting for the 30 s slot
+        await source.stop()
+
+    async def test_loop_polls_on_interval(self):
+        source, client = make_source(poll_interval=0.02, min_poll_spacing=0)
+        await source.start(["AAPL"])
+        await asyncio.sleep(0.15)
+        assert client.get_snapshot_all.call_count >= 3
+        await source.stop()
+
+
+class TestFailures:
+    async def test_error_does_not_raise(self):
         cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache)
+        source, client = make_source(cache)
+        client.get_snapshot_all.side_effect = ConnectionError("network down")
+        await source.start(["AAPL"])  # must not raise
+        assert cache.get("AAPL") is None
+        await source.stop()
 
-        await source.add_ticker("  AAPL  ")
-        assert "AAPL" in source.get_tickers()
+    async def test_backoff_grows_and_caps(self):
+        source, client = make_source(poll_interval=15)
+        client.get_snapshot_all.side_effect = BadResponse("exceeded the maximum requests")
+        source._tickers = ["AAPL"]
+        backoffs = []
+        for _ in range(6):
+            await source._poll_once()
+            backoffs.append(source._backoff)
+        assert backoffs == [15, 30, 60, 120, 120, 120]
+
+    async def test_auth_error_backs_off_to_max(self):
+        source, client = make_source()
+        client.get_snapshot_all.side_effect = BadResponse('{"status":"NOT_AUTHORIZED"}')
+        source._tickers = ["AAPL"]
+        await source._poll_once()
+        assert source._backoff == MAX_BACKOFF
+
+    async def test_success_resets_backoff(self):
+        cache = PriceCache()
+        source, client = make_source(cache)
+        source._tickers = ["AAPL"]
+        client.get_snapshot_all.side_effect = ConnectionError()
+        await source._poll_once()
+        assert source._backoff > 0
+        client.get_snapshot_all.side_effect = None
+        client.get_snapshot_all.return_value = [snap(AAPL_JSON)]
+        await source._poll_once()
+        assert source._backoff == 0
+        assert source._failures == 0
+        assert cache.get_price("AAPL") == 190.42
+
+
+class TestTickerManagement:
+    async def test_add_ticker_before_start(self):
+        source, client = make_source()
+        await source.add_ticker("aapl")
+        await source.start(["MSFT"])
+        assert source.get_tickers() == ["AAPL", "MSFT"]
+        await source.stop()
+
+    async def test_add_ticker_normalizes(self):
+        source, _ = make_source()
+        await source.add_ticker("  aapl  ")
+        assert source.get_tickers() == ["AAPL"]
+
+    async def test_add_duplicate_is_noop(self):
+        source, _ = make_source()
+        await source.add_ticker("AAPL")
+        await source.add_ticker("aapl")
+        assert source.get_tickers() == ["AAPL"]
+
+    async def test_add_invalid_raises(self):
+        source, _ = make_source()
+        with pytest.raises(ValueError):
+            await source.add_ticker("NOT A TICKER")
 
     async def test_remove_ticker(self):
-        """Test removing a ticker."""
         cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache)
-        source._tickers = ["AAPL", "GOOGL"]
+        source, _ = make_source(cache)
+        await source.add_ticker("AAPL")
+        await source.add_ticker("GOOGL")
         cache.update("AAPL", 190.00)
-
-        await source.remove_ticker("AAPL")
-        assert "AAPL" not in source.get_tickers()
+        await source.remove_ticker("aapl")
+        assert source.get_tickers() == ["GOOGL"]
         assert cache.get("AAPL") is None
 
-    async def test_get_tickers(self):
-        """Test getting the list of active tickers."""
-        cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache)
-        source._tickers = ["AAPL", "GOOGL"]
+    async def test_remove_unknown_is_noop(self):
+        source, _ = make_source()
+        await source.remove_ticker("AAPL")
+        assert source.get_tickers() == []
 
-        tickers = source.get_tickers()
-        assert tickers == ["AAPL", "GOOGL"]
 
-    async def test_empty_tickers_skips_poll(self):
-        """Test that polling is skipped when there are no tickers."""
-        cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache)
-        source._tickers = []
-
-        # Should not call _fetch_snapshots
-        with patch.object(source, "_fetch_snapshots") as mock_fetch:
-            await source._poll_once()
-            mock_fetch.assert_not_called()
-
+class TestLifecycle:
     async def test_stop_is_idempotent(self):
-        """Test that stop() can be called multiple times."""
-        cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache)
-
+        source, _ = make_source()
         await source.stop()
-        await source.stop()  # Should not raise
+        await source.stop()
 
     async def test_stop_cancels_task(self):
-        """Test that stop() cancels the polling task."""
-        cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=10.0)
-
-        # Mock the client and start
-        with patch("app.market.massive_client.RESTClient"):
-            with patch.object(source, "_fetch_snapshots", return_value=[]):
-                await source.start(["AAPL"])
-
-        # Verify task is running
-        assert source._task is not None
-        assert not source._task.done()
-
-        # Stop and verify task is cancelled
+        source, _ = make_source()
+        await source.start(["AAPL"])
+        task = source._task
+        assert task is not None and not task.done()
         await source.stop()
+        assert task.done()
         assert source._task is None
 
-    async def test_start_immediate_poll(self):
-        """Test that start() does an immediate poll before starting the loop."""
-        cache = PriceCache()
-        source = MassiveDataSource(api_key="test-key", price_cache=cache, poll_interval=60.0)
-
-        mock_snapshots = [_make_snapshot("AAPL", 190.50, 1707580800000)]
-
-        with patch("app.market.massive_client.RESTClient"):
-            with patch.object(source, "_fetch_snapshots", return_value=mock_snapshots):
-                await source.start(["AAPL"])
-
-        # Cache should have data immediately from the first poll
-        assert cache.get_price("AAPL") == 190.50
-
+    async def test_request_url_built_by_real_sdk(self):
+        """Drive the real RESTClient down to the HTTP layer and check the URL."""
+        client = RESTClient(api_key="test-key", retries=0)
+        source = MassiveDataSource("test-key", PriceCache(), client=client)
+        with patch.object(client, "_get", return_value=[]) as get:
+            await source.start(["AAPL", "MSFT"])
         await source.stop()
+        kwargs = get.call_args.kwargs
+        assert kwargs["path"] == "/v2/snapshot/locale/us/markets/stocks/tickers"
+        assert kwargs["params"]["tickers"] == "AAPL,MSFT"
+
+    def test_default_client_disables_urllib3_retries(self):
+        source = MassiveDataSource("test-key", PriceCache())
+        assert source._client.retries == 0
+
+    def test_min_spacing_defaults(self):
+        free, _ = make_source(poll_interval=15)
+        paid, _ = make_source(poll_interval=2)
+        assert free._min_spacing == 12.0
+        assert paid._min_spacing == 2.0

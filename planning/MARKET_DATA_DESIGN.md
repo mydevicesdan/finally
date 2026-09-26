@@ -1,9 +1,9 @@
 # Market Data Backend — Detailed Design
 
-**Status:** Design of record for `backend/app/market/`. Supersedes `planning/archive/MARKET_DATA_DESIGN.md`.
+**Status:** Design of record for `backend/app/market/`, and **implemented**. The code blocks below are generated from the modules in `backend/app/market/`. Supersedes `planning/archive/MARKET_DATA_DESIGN.md`.
 **Audience:** The Backend / Market Data agent implementing or changing the market data subsystem, and the agents building the portfolio, watchlist, chat and frontend layers that consume it.
 
-The market data subsystem already exists (see `MARKET_DATA_SUMMARY.md`). This document is a full design for it: the unified API, the GBM simulator and the Massive API client. It includes every module as working code. Where the design changes the current code, the change is listed in §2 and marked **(change)** in the sections below. All code here was run against `massive==2.2.0`, `numpy>=2`, Python 3.12, and the test suite in §15 passes.
+The market data subsystem already exists (see `MARKET_DATA_SUMMARY.md`). This document is a full design for it: the unified API, the GBM simulator and the Massive API client. It includes every module as working code. Where the design changes the current code, the change is listed in §2 and marked **(change)** in the sections below. All code here runs against `massive==2.2.0`, `numpy>=2` and Python 3.12. The backend test suite (174 tests, 100% coverage) passes.
 
 ---
 
@@ -49,7 +49,7 @@ From `PLAN.md` §6, plus what the consuming features need:
 
 ## 2. Changes From the Current Implementation
 
-The current code works for the simulator path but has gaps. This design fixes them. Items 1–3 affect behaviour users will see.
+The code that existed before this design worked for the simulator path but had gaps. This design fixes them, and all fixes are implemented. Items 1–3 and 16 affected behaviour users would see.
 
 | # | Severity | Problem in current code | Fix in this design |
 |---|---|---|---|
@@ -68,6 +68,7 @@ The current code works for the simulator path but has gaps. This design fixes th
 | 13 | Low | Simulator uses global `np.random` / `random`, so tests can't be deterministic. `add_ticker()` before `start()` is silently dropped. A second `start()` leaks a task. | Per-instance `np.random.Generator(seed)`. The simulator is created eagerly. A second `start()` raises `RuntimeError`. |
 | 14 | Low | No SSE keep-alive. An idle stream (empty watchlist) can be closed by proxies. | Comment heartbeat every 15 s (§12). |
 | 15 | Low | `np.linalg.cholesky` failure (a bad edit to correlation constants) would crash the simulator. | Fall back to independent moves and log a warning (§9.3). |
+| 16 | **High** | `get_snapshot_all(market_type=SnapshotMarketType.STOCKS)`. In `massive` 2.x, `SnapshotMarketType` is a plain `Enum`. The SDK formats the member itself into the URL, which gives `/v2/snapshot/locale/global/markets/SnapshotMarketType.STOCKS/tickers`. That endpoint doesn't exist, so every request fails. Found during implementation. | Pass `SnapshotMarketType.STOCKS.value` (`"stocks"`). A regression test drives the real `RESTClient` down to `_get` and asserts the path (§10.4). |
 
 `MASSIVE_API.md` (archive) is also inaccurate for the installed SDK. §10.2 is the corrected field reference.
 
@@ -138,19 +139,30 @@ backend/app/market/
   massive_client.py   parse_snapshot(), classify_error(), MassiveDataSource
   factory.py          create_market_data_source()
   stream.py           create_stream_router(), generate_price_events()
-backend/app/market_sync.py   sync_tracked_tickers()  — app layer, needs the DB (§13.3)
+  sync.py             sync_tracked_tickers(source, desired)              (new)
 ```
 
 **`app/market/__init__.py`**
 
 ```python
-"""Market data subsystem for FinAlly."""
+"""Market data subsystem for FinAlly.
+
+Public API:
+    PriceUpdate               - Immutable price snapshot dataclass
+    PriceCache                - Thread-safe in-memory price store
+    MarketDataSource          - Abstract interface for data providers
+    create_market_data_source - Factory that selects simulator or Massive
+    create_stream_router      - FastAPI router factory for the SSE endpoint
+    normalize_ticker          - Canonical, validated ticker symbol
+    sync_tracked_tickers      - Make a source track exactly a given ticker set
+"""
 
 from .cache import PriceCache
 from .factory import create_market_data_source
 from .interface import MarketDataSource
 from .models import PriceUpdate
 from .stream import create_stream_router
+from .sync import sync_tracked_tickers
 from .tickers import normalize_ticker
 
 __all__ = [
@@ -160,6 +172,7 @@ __all__ = [
     "create_market_data_source",
     "create_stream_router",
     "normalize_ticker",
+    "sync_tracked_tickers",
 ]
 ```
 
@@ -833,7 +846,7 @@ class SimulatorDataSource(MarketDataSource):
 | Package | `massive` (formerly `polygon-api-client`); locked at 2.2.0 |
 | Base URL | `https://api.massive.com` (legacy `api.polygon.io` still served) |
 | Endpoint | `GET /v2/snapshot/locale/us/markets/stocks/tickers?tickers=AAPL,MSFT,…` |
-| SDK call | `RESTClient.get_snapshot_all(market_type=SnapshotMarketType.STOCKS, tickers=[...])` |
+| SDK call | `RESTClient.get_snapshot_all(market_type=SnapshotMarketType.STOCKS.value, tickers=[...])`. Pass the **string** value; the enum member itself builds a wrong URL in 2.x. |
 | Cost | **One request for all tickers**, so the request rate doesn't depend on watchlist size |
 | Free tier | 5 requests/min → poll every **15 s** (minimum spacing 12 s) |
 | Paid tiers | effectively unlimited; poll every 2–5 s (`MASSIVE_POLL_INTERVAL`) |
@@ -991,7 +1004,9 @@ class MassiveDataSource(MarketDataSource):
         self._cache = price_cache
         self._interval = poll_interval
         self._min_spacing = (
-            min(poll_interval, FREE_TIER_MIN_SPACING) if min_poll_spacing is None else min_poll_spacing
+            min(poll_interval, FREE_TIER_MIN_SPACING)
+            if min_poll_spacing is None
+            else min_poll_spacing
         )
         self._tickers: list[str] = []
         self._task: asyncio.Task | None = None
@@ -1096,7 +1111,10 @@ class MassiveDataSource(MarketDataSource):
     def _fetch_snapshots(self, tickers: list[str]) -> list[TickerSnapshot]:
         """Blocking HTTP call; runs in a worker thread."""
         return self._client.get_snapshot_all(
-            market_type=SnapshotMarketType.STOCKS,
+            # Pass the string value: SnapshotMarketType is a plain Enum in massive
+            # 2.x, and the SDK formats the enum member itself into the URL
+            # ("/locale/global/markets/SnapshotMarketType.STOCKS/...").
+            market_type=SnapshotMarketType.STOCKS.value,
             tickers=tickers,
         )
 
@@ -1402,31 +1420,52 @@ def get_market_source(request: Request) -> MarketDataSource:
     return request.app.state.market_source
 ```
 
-### 13.3 Keeping the tracked set right — `app/market_sync.py`
+### 13.3 Keeping the tracked set right — `app/market/sync.py`
 
-The tracked set is **watchlist ∪ tickers with an open position**. Deriving it from the DB and reconciling after every change is simpler and more robust than adding and removing incrementally in each route:
+The tracked set is **watchlist ∪ tickers with an open position**. Deriving it from the DB and reconciling after every change is simpler and more robust than adding and removing incrementally in each route. The market package provides the DB-agnostic reconciler:
 
 ```python
-"""Keep the market data source tracking exactly watchlist ∪ open positions."""
+"""Reconcile the data source's tracked tickers with the set the app needs."""
 
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+from .interface import MarketDataSource
+from .tickers import normalize_ticker
+
+
+async def sync_tracked_tickers(source: MarketDataSource, desired: Iterable[str]) -> None:
+    """Make `source` track exactly `desired`.
+
+    The app layer passes watchlist ∪ tickers with an open position, so a held
+    ticker keeps its price after it is removed from the watchlist. Call after
+    every watchlist change, trade, and LLM action batch.
+    """
+    wanted = {normalize_ticker(t) for t in desired}
+    current = set(source.get_tickers())
+    for ticker in sorted(wanted - current):
+        await source.add_ticker(ticker)
+    for ticker in sorted(current - wanted):
+        await source.remove_ticker(ticker)
+```
+
+The app layer supplies the desired set from the database (`app/market_sync.py`):
+
+```python
 from app import db
-from app.market import MarketDataSource
+from app.market import MarketDataSource, sync_tracked_tickers
 
 
 def desired_tickers(user_id: str = "default") -> set[str]:
     return set(db.get_watchlist_tickers(user_id)) | set(db.get_position_tickers(user_id))
 
 
-async def sync_tracked_tickers(source: MarketDataSource, user_id: str = "default") -> None:
-    desired = desired_tickers(user_id)
-    current = set(source.get_tickers())
-    for ticker in sorted(desired - current):
-        await source.add_ticker(ticker)
-    for ticker in sorted(current - desired):
-        await source.remove_ticker(ticker)
+async def sync_market(source: MarketDataSource, user_id: str = "default") -> None:
+    await sync_tracked_tickers(source, desired_tickers(user_id))
 ```
 
-Call `sync_tracked_tickers()` after watchlist add/remove, after every trade, and after the chat flow runs LLM actions. It's O(tickers) with no I/O beyond two small queries.
+Call `sync_market()` after watchlist add/remove, after every trade, and after the chat flow runs LLM actions. It's O(tickers) with no I/O beyond two small queries.
 
 **Watchlist routes**
 
@@ -1437,7 +1476,7 @@ from pydantic import BaseModel
 from app import db
 from app.deps import get_market_source, get_price_cache
 from app.market import MarketDataSource, PriceCache, normalize_ticker
-from app.market_sync import sync_tracked_tickers
+from app.market_sync import sync_market
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -1466,7 +1505,7 @@ async def add_to_watchlist(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     db.add_watchlist_ticker(ticker)           # idempotent (UNIQUE user_id, ticker)
-    await sync_tracked_tickers(source)
+    await sync_market(source)
     update = cache.get(ticker)                # simulator: already there; Massive: maybe next poll
     return {"ticker": ticker, "price": update.price if update else None}
 
@@ -1478,7 +1517,7 @@ async def remove_from_watchlist(ticker: str, source: MarketDataSource = Depends(
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     db.remove_watchlist_ticker(ticker)
-    await sync_tracked_tickers(source)        # still tracked if a position is open
+    await sync_market(source)        # still tracked if a position is open
 ```
 
 ### 13.4 Consumers
@@ -1501,7 +1540,7 @@ async def current_price_for_trade(
     return price
 ```
 
-After the trade (success **or** failure), call `sync_tracked_tickers(source)`. A newly held ticker stays tracked. A ticker added only to price a failed trade is dropped again. A position sold to zero on a non-watchlist ticker is dropped.
+After the trade (success **or** failure), call `sync_market(source)`. A newly held ticker stays tracked. A ticker added only to price a failed trade is dropped again. A position sold to zero on a non-watchlist ticker is dropped.
 
 **Portfolio valuation (`GET /api/portfolio`, snapshots, LLM context)**
 
