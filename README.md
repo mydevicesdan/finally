@@ -37,6 +37,17 @@ docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
 # Open http://localhost:8000
 ```
 
+## Market Data Demo
+
+A standalone Rich-powered terminal dashboard for the market data simulator lives at `backend/market_data_demo.py`:
+
+```bash
+cd backend
+uv run market_data_demo.py
+```
+
+It streams all 10 default tickers with live sparklines, direction arrows, and an event log for notable price moves, independent of the full app.
+
 ## Environment Variables
 
 | Variable | Required | Description |
