@@ -1,0 +1,28 @@
+{
+    "permissions": [
+        "Bash(codex exec:*)",
+        "mcp__plugin_context7_context7__resolve-library-id",
+        "mcp__plugin_context7_context7__query-docs",
+        "WebSearch",
+        "WebFetch(domain:massive.com)",
+        "WebFetch(domain:github.com)",
+        "Bash(gh api:*)",
+        "Bash(security find-certificate:*)",
+        "Bash(networksetup -getwebproxy:*",
+        "Bash(echo:*)",
+        "Bash(curl:*)",
+        "Bash(gh search:*)",
+        "Bash(gh issue view:*)",
+        "Bash(claude auth:*)",
+        "Bash(claude auth whoami:*)",
+        "Bash(python3:*)",
+        "Bash(ls:*)"
+    ]
+}
+
+{
+    "sandbox": {
+        "enabled": false,
+        "autoAllowBashIfsandboxed": false
+    }
+}
